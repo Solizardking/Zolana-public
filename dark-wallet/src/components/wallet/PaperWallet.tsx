@@ -1,0 +1,1011 @@
+import React, { useMemo, useState } from 'react';
+import { useConnection, useWallet } from '@solana/wallet-adapter-react';
+import {
+  generateSolanaPaperWallet,
+  paperWalletFileName,
+  serializeSolanaPaperWallet,
+  type SolanaPaperWallet,
+} from '../../utils/paper-wallet';
+import {
+  formatNetworkLabel,
+  getDarkRuntimeConfig,
+} from '../../utils/runtime';
+import {
+  createDarkClawdRailPlan,
+  fingerprintPublicValue,
+  formatDarkClawdRailPlan,
+  type DarkClawdRailPlan,
+} from '../../utils/dark-clawd-agent';
+import { createDarkProtocolClient } from '../../sdk/dark-protocol';
+import {
+  appendPrivatePaymentReceipt,
+  createPrivatePaymentProofPayload,
+  loadPrivatePaymentReceipts,
+  markPrivatePaymentAnchored,
+  markPrivatePaymentFailed,
+  markPrivatePaymentRailFailed,
+  markPrivatePaymentRailStatus,
+  markPrivatePaymentRailSubmitted,
+  markPrivatePaymentVerificationFailed,
+  markPrivatePaymentVerified,
+  serializePrivatePaymentProofPayload,
+  stagePrivatePayment,
+  updatePrivatePaymentReceipt,
+  verifyPrivatePaymentProofPayload,
+  type PrivatePaymentProofLayer,
+  type PrivatePaymentRail,
+  type PrivatePaymentReceipt,
+  type PrivatePaymentSettlement,
+} from '../../sdk/private-payment';
+import {
+  createRailAuthorizationEnvelope,
+  serializeRailAuthorizationEnvelope,
+  verifyRailAuthorizationEnvelope,
+} from '../../sdk/rail-authorization';
+import {
+  getRailWorkerPreflight,
+  getRailWorkerSettlement,
+  planRailWithWorker,
+  railWorkerStatusFromAuthorizeResult,
+  railWorkerStatusFromLedgerEntry,
+  submitRailAuthorizationToWorker,
+  type RailWorkerPreflightResult,
+} from '../../sdk/rail-worker-client';
+
+function downloadFile(filename: string, content: string): void {
+  const blob = new Blob([content], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+type ReceiptEvmVerifierPlan = NonNullable<NonNullable<PrivatePaymentReceipt['railWorker']>['evmVerifierPlan']>;
+
+function shortenRailValue(value?: string, head = 12, tail = 8): string {
+  if (!value) return 'not recorded';
+  if (value.length <= head + tail + 3) return value;
+  return `${value.slice(0, head)}...${value.slice(-tail)}`;
+}
+
+const EvmVerifierPlanPanel: React.FC<{ plan?: ReceiptEvmVerifierPlan }> = ({ plan }) => {
+  if (!plan) return null;
+
+  const statusClass = plan.ready
+    ? 'evm-plan-status-ready'
+    : plan.status === 'not-required'
+      ? 'evm-plan-status-muted'
+      : 'evm-plan-status-blocked';
+
+  return (
+    <div className="evm-plan-ticket">
+      <div className="evm-plan-header">
+        <div>
+          <p className="section-kicker">EVM Intent Proof</p>
+          <h5>EVM verifier handoff</h5>
+        </div>
+        <span className={`evm-plan-status ${statusClass}`}>
+          {plan.status ?? 'unknown'}
+        </span>
+      </div>
+
+      <div className="evm-plan-grid">
+        <div>
+          <span>Verifier</span>
+          <strong>{shortenRailValue(plan.verifier, 10, 8)}</strong>
+        </div>
+        <div>
+          <span>Chain</span>
+          <strong>{plan.chainId ?? 'unset'}</strong>
+        </div>
+        <div>
+          <span>Intent digest</span>
+          <strong>{shortenRailValue(plan.digest, 12, 10)}</strong>
+        </div>
+        <div>
+          <span>Solana slot</span>
+          <strong>{plan.solanaSlot ?? 'unverified'}</strong>
+        </div>
+      </div>
+
+      {plan.planDigest && (
+        <p className="evm-plan-digest">
+          Plan digest: {shortenRailValue(plan.planDigest, 14, 12)}
+        </p>
+      )}
+
+      {plan.problems && plan.problems.length > 0 && (
+        <ul className="evm-plan-problems">
+          {plan.problems.map((problem) => (
+            <li key={problem}>{problem}</li>
+          ))}
+        </ul>
+      )}
+
+      {(plan.signCommand || plan.submitCommand) && (
+        <div className="evm-plan-commands">
+          {plan.signCommand && (
+            <code>{plan.signCommand}</code>
+          )}
+          {plan.submitCommand && (
+            <code>{plan.submitCommand}</code>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const railOrder: PrivatePaymentRail[] = ['x402', 'ap2', 'm2m'];
+
+const RailPreflightPanel: React.FC<{ preflight: RailWorkerPreflightResult }> = ({ preflight }) => {
+  const statusClass = preflight.mode === 'live-ready' || preflight.ready
+    ? 'rail-preflight-status-ready'
+    : preflight.mode === 'blocked'
+      ? 'rail-preflight-status-blocked'
+      : 'rail-preflight-status-warn';
+
+  return (
+    <div className="rail-preflight-ticket">
+      <div className="rail-preflight-header">
+        <div>
+          <p className="section-kicker">Rail Worker Preflight</p>
+          <h5>{preflight.workerUrl}</h5>
+        </div>
+        <span className={`rail-preflight-status ${statusClass}`}>
+          {preflight.mode ?? 'unknown'}
+        </span>
+      </div>
+
+      <div className="rail-preflight-grid">
+        <div>
+          <span>Solana RPC</span>
+          <strong>{preflight.solana?.status ?? 'unknown'}</strong>
+          <small>{preflight.solana?.rpcEndpoint ?? 'no endpoint'}</small>
+        </div>
+        <div>
+          <span>EVM verifier</span>
+          <strong>{preflight.evm?.status ?? 'unknown'}</strong>
+          <small>{preflight.evm?.verifier ? shortenRailValue(preflight.evm.verifier, 10, 8) : 'not configured'}</small>
+        </div>
+        <div>
+          <span>Dark Clawd</span>
+          <strong>{preflight.xai?.status ?? 'unknown'}</strong>
+          <small>{preflight.xai?.model ?? 'local policy'}</small>
+        </div>
+        <div>
+          <span>Replay ledger</span>
+          <strong>{preflight.replayLedger?.status ?? 'unknown'}</strong>
+          <small>{preflight.replayLedger?.durable ? 'durable' : 'memory only'}</small>
+        </div>
+      </div>
+
+      <div className="rail-preflight-rails">
+        {railOrder.map((railName) => {
+          const railStatus = preflight.rails?.[railName];
+          return (
+            <div key={railName}>
+              <span>{railName.toUpperCase()}</span>
+              <strong>{railStatus?.status ?? 'unknown'}</strong>
+              <small>{railStatus?.endpoint ?? 'backend missing'}</small>
+            </div>
+          );
+        })}
+      </div>
+
+      {(preflight.blockers?.length || preflight.warnings?.length) ? (
+        <div className="rail-preflight-notes">
+          {preflight.blockers?.map((item) => (
+            <p key={`blocker-${item}`} className="rail-preflight-blocker">{item}</p>
+          ))}
+          {preflight.warnings?.map((item) => (
+            <p key={`warning-${item}`}>{item}</p>
+          ))}
+        </div>
+      ) : (
+        <p className="rail-preflight-clean">Preflight passed without blockers or warnings.</p>
+      )}
+    </div>
+  );
+};
+
+const PaperWallet: React.FC = () => {
+  const wallet = useWallet();
+  const { publicKey } = wallet;
+  const { connection } = useConnection();
+  const runtime = useMemo(() => getDarkRuntimeConfig(), []);
+
+  const [label, setLabel] = useState('ZOLana paper wallet');
+  const [entropy, setEntropy] = useState('');
+  const [paperWallet, setPaperWallet] = useState<SolanaPaperWallet | null>(null);
+  const [showSecret, setShowSecret] = useState(false);
+  const [status, setStatus] = useState('');
+  const [agentPrompt, setAgentPrompt] = useState('Flag any rail-planning or custody issues before I submit this payment.');
+  const [isBusy, setIsBusy] = useState(false);
+  const [rail, setRail] = useState<PrivatePaymentRail>('x402');
+  const [settlement, setSettlement] = useState<PrivatePaymentSettlement>('solana');
+  const [proofLayer, setProofLayer] = useState<PrivatePaymentProofLayer>('evm');
+  const [durableReceipt, setDurableReceipt] = useState(true);
+  const [paymentAmount, setPaymentAmount] = useState('0.25');
+  const [paymentRecipient, setPaymentRecipient] = useState('');
+  const [paymentMemo, setPaymentMemo] = useState('private settlement');
+  const [lastPayment, setLastPayment] = useState<PrivatePaymentReceipt | null>(null);
+  const [paymentReceipts, setPaymentReceipts] = useState<PrivatePaymentReceipt[]>(() => loadPrivatePaymentReceipts());
+  const [anchoringReceiptId, setAnchoringReceiptId] = useState<string | null>(null);
+  const [verifyingReceiptId, setVerifyingReceiptId] = useState<string | null>(null);
+  const [checkingProofId, setCheckingProofId] = useState<string | null>(null);
+  const [checkingRailId, setCheckingRailId] = useState<string | null>(null);
+  const [submittingRailId, setSubmittingRailId] = useState<string | null>(null);
+  const [refreshingRailId, setRefreshingRailId] = useState<string | null>(null);
+  const [planningRail, setPlanningRail] = useState(false);
+  const [railPlan, setRailPlan] = useState<DarkClawdRailPlan | null>(null);
+  const [railPlanResponse, setRailPlanResponse] = useState('');
+  const [railPreflight, setRailPreflight] = useState<RailWorkerPreflightResult | null>(null);
+  const [checkingRailPreflight, setCheckingRailPreflight] = useState(false);
+  const [probingRailPreflight, setProbingRailPreflight] = useState(false);
+
+  const railOptionsForReceipt = (receipt: PrivatePaymentReceipt) => ({
+    evmChainId: runtime.evmChainId,
+    evmVerifyingContract: runtime.evmPrivatePaymentVerifier,
+    machinePayer: receipt.solanaAnchor?.payer ?? publicKey?.toBase58(),
+    machinePayee: receipt.recipient,
+  });
+
+  const railPlanContext = (receipt?: PrivatePaymentReceipt) => ({
+    network: runtime.defaultNetwork,
+    amountSol: receipt?.amountSol ?? Number(paymentAmount),
+    recipientFingerprint: fingerprintPublicValue(
+      receipt?.recipient || paymentRecipient.trim() || publicKey?.toBase58() || 'private-counterparty',
+    ),
+    memoFingerprint: (receipt?.memo || paymentMemo).trim()
+      ? fingerprintPublicValue(receipt?.memo || paymentMemo)
+      : undefined,
+    rail: receipt?.rail ?? rail,
+    settlement: receipt?.settlement ?? settlement,
+    proofLayer: receipt?.proofLayer ?? proofLayer,
+    durableReceipt: receipt?.durableReceipt ?? durableReceipt,
+    heliusConfigured: Boolean(runtime.heliusRpcUrl || runtime.solanaRpcUrl),
+    evmChainId: runtime.evmChainId,
+    evmVerifierConfigured: Boolean(runtime.evmPrivatePaymentVerifier),
+    railWorkerConfigured: Boolean(runtime.railWorkerUrl),
+    hasSolanaAnchor: Boolean(receipt?.solanaAnchor?.signature),
+    solanaAnchorVerified: Boolean(receipt?.solanaVerification?.memoMatched),
+    railWorkerMode: receipt?.railWorker?.mode,
+    railWorkerSettlementStatus: receipt?.railWorker?.settlementStatus,
+    operatorPrompt: agentPrompt,
+  });
+
+  const handlePlanPaymentRail = async (receipt?: PrivatePaymentReceipt) => {
+    const context = railPlanContext(receipt);
+    const deterministicPlan = createDarkClawdRailPlan(context);
+    setRailPlan(deterministicPlan);
+    setRailPlanResponse(formatDarkClawdRailPlan(deterministicPlan));
+
+    if (!Number.isFinite(context.amountSol) || context.amountSol <= 0) {
+      setStatus('Enter a valid amount before asking Dark Clawd to plan rails');
+      return;
+    }
+
+    setPlanningRail(true);
+    try {
+      if (runtime.railWorkerUrl) {
+        setStatus('Rail worker Dark Clawd is planning with server-side public metadata...');
+        const workerResult = await planRailWithWorker(runtime.railWorkerUrl, context);
+        if (workerResult.ok && workerResult.plan) {
+          setRailPlan(workerResult.plan);
+          setRailPlanResponse([
+            `Rail worker ${workerResult.mode === 'xai' ? 'xAI review' : 'local policy'}:`,
+            workerResult.modelReview || 'No server-side model review returned; using rail-worker deterministic policy.',
+            '',
+            'Worker guardrail:',
+            formatDarkClawdRailPlan(workerResult.plan),
+            '',
+            `Prompt digest: ${workerResult.promptDigest ?? 'not returned'}`,
+          ].join('\n'));
+          setStatus(`Rail worker Dark Clawd plan complete (${workerResult.mode ?? 'local'} mode)`);
+          return;
+        }
+
+        setStatus(workerResult.error || workerResult.errors?.join('; ') || 'Rail worker planning failed; falling back locally');
+      }
+
+      setStatus('Local Dark Clawd policy plan ready. Configure RAIL_WORKER_URL for server-side model review.');
+    } catch (error: any) {
+      setStatus(`Rail planning agent error: ${error.message}`);
+    } finally {
+      setPlanningRail(false);
+    }
+  };
+
+  const handleApplyRailPlan = () => {
+    if (!railPlan) {
+      setStatus('Ask Dark Clawd for a rail plan before applying recommendations');
+      return;
+    }
+
+    setRail(railPlan.recommendedRail);
+    setSettlement(railPlan.recommendedSettlement);
+    setProofLayer(railPlan.recommendedProofLayer);
+    setDurableReceipt(railPlan.requireDurableReceipt);
+    setStatus(`Applied Dark Clawd plan: ${railPlan.summary}`);
+  };
+
+  const handleCheckRailPreflight = async (probe = false) => {
+    if (!runtime.railWorkerUrl) {
+      setStatus('Set RAIL_WORKER_URL or VITE_RAIL_WORKER_URL to run rail preflight');
+      return;
+    }
+
+    if (probe) {
+      setProbingRailPreflight(true);
+    } else {
+      setCheckingRailPreflight(true);
+    }
+
+    setStatus(probe ? 'Probing configured rail backends...' : 'Checking rail worker preflight...');
+    try {
+      const result = await getRailWorkerPreflight(runtime.railWorkerUrl, { probe });
+      setRailPreflight(result);
+      if (!result.ok) {
+        setStatus(result.error || result.errors?.join('; ') || `Rail preflight returned HTTP ${result.status}`);
+        return;
+      }
+
+      setStatus(
+        `Rail preflight ${result.mode ?? 'unknown'}: ${
+          result.ready ? 'ready for configured live rails' : 'not ready for live settlement'
+        }`,
+      );
+    } catch (error: any) {
+      setStatus(`Rail preflight error: ${error.message}`);
+    } finally {
+      if (probe) {
+        setProbingRailPreflight(false);
+      } else {
+        setCheckingRailPreflight(false);
+      }
+    }
+  };
+
+  const handleGenerate = async () => {
+    setIsBusy(true);
+    setStatus('Generating local Solana paper wallet...');
+    try {
+      const next = await generateSolanaPaperWallet({
+        label,
+        entropy,
+        network: runtime.defaultNetwork,
+      });
+      setPaperWallet(next);
+      setShowSecret(false);
+      setStatus(`Generated ${next.publicKey.slice(0, 8)}... on ${formatNetworkLabel(next.network)}`);
+    } catch (error: any) {
+      setStatus(`Error: ${error.message}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleDownload = () => {
+    if (!paperWallet) return;
+    downloadFile(paperWalletFileName(paperWallet), serializeSolanaPaperWallet(paperWallet));
+    setStatus('Paper wallet JSON downloaded');
+  };
+
+  const handlePrint = () => {
+    if (!paperWallet) {
+      setStatus('Generate a paper wallet before printing');
+      return;
+    }
+    setShowSecret(true);
+    window.requestAnimationFrame(() => window.print());
+  };
+
+  const handleStagePayment = () => {
+    try {
+      const receipt = stagePrivatePayment({
+        amountSol: Number(paymentAmount),
+        recipient: paymentRecipient.trim() || publicKey?.toBase58() || 'private-counterparty',
+        rail,
+        settlement,
+        proofLayer,
+        durableReceipt,
+        memo: paymentMemo,
+      });
+      const receipts = appendPrivatePaymentReceipt(receipt);
+      setLastPayment(receipt);
+      setPaymentReceipts(receipts);
+      setStatus(`Queued ${receipt.amountSol} SOL via ${receipt.rail.toUpperCase()} with ${receipt.proofLayer.toUpperCase()} proofing; durable receipt stored locally`);
+    } catch (error: any) {
+      setStatus(`Payment error: ${error.message}`);
+    }
+  };
+
+  const handleExportPaymentProof = (receipt: PrivatePaymentReceipt) => {
+    const payload = createPrivatePaymentProofPayload(receipt, {
+      evmChainId: runtime.evmChainId,
+      evmVerifyingContract: runtime.evmPrivatePaymentVerifier,
+    });
+    downloadFile(
+      `zolana-private-payment-proof-${receipt.id}.json`,
+      serializePrivatePaymentProofPayload(payload),
+    );
+    setStatus(`Exported EVM proof payload for ${receipt.id} on chain ${runtime.evmChainId}`);
+  };
+
+  const handleCheckEvmProof = (receipt: PrivatePaymentReceipt) => {
+    setCheckingProofId(receipt.id);
+    try {
+      const options = {
+        evmChainId: runtime.evmChainId,
+        evmVerifyingContract: runtime.evmPrivatePaymentVerifier,
+      };
+      const payload = createPrivatePaymentProofPayload(receipt, options);
+      const verification = verifyPrivatePaymentProofPayload(payload, receipt, options);
+      if (!verification.ok) {
+        setStatus(`EVM proof payload mismatch: ${verification.mismatches.join('; ')}`);
+        return;
+      }
+
+      setStatus(`EVM proof payload verified for ${receipt.id}: ${verification.actualDigest.slice(0, 18)}...`);
+    } finally {
+      setCheckingProofId(null);
+    }
+  };
+
+  const handleExportRailAuthorization = (receipt: PrivatePaymentReceipt) => {
+    try {
+      const envelope = createRailAuthorizationEnvelope(receipt, {
+        evmChainId: runtime.evmChainId,
+        evmVerifyingContract: runtime.evmPrivatePaymentVerifier,
+        machinePayer: receipt.solanaAnchor?.payer ?? publicKey?.toBase58(),
+        machinePayee: receipt.recipient,
+      });
+      downloadFile(
+        `zolana-rail-authorization-${receipt.id}.json`,
+        serializeRailAuthorizationEnvelope(envelope),
+      );
+      setStatus(`Exported ${receipt.rail.toUpperCase()} rail authorization ${envelope.authorizationId}`);
+    } catch (error: any) {
+      setStatus(`Rail authorization error: ${error.message}`);
+    }
+  };
+
+  const handleCheckRailAuthorization = (receipt: PrivatePaymentReceipt) => {
+    setCheckingRailId(receipt.id);
+    try {
+      const options = railOptionsForReceipt(receipt);
+      const envelope = createRailAuthorizationEnvelope(receipt, options);
+      const verification = verifyRailAuthorizationEnvelope(envelope, receipt, options);
+      if (!verification.ok) {
+        setStatus(`Rail authorization mismatch: ${verification.mismatches.join('; ')}`);
+        return;
+      }
+
+      setStatus(`Rail authorization verified: ${verification.actualAuthorizationId}`);
+    } catch (error: any) {
+      setStatus(`Rail authorization check error: ${error.message}`);
+    } finally {
+      setCheckingRailId(null);
+    }
+  };
+
+  const handleSubmitRailAuthorization = async (receipt: PrivatePaymentReceipt) => {
+    if (!runtime.railWorkerUrl) {
+      setStatus('Set RAIL_WORKER_URL or VITE_RAIL_WORKER_URL to submit rail authorizations');
+      return;
+    }
+
+    if (!receipt.solanaAnchor?.signature) {
+      setStatus('Anchor the private-payment receipt on Solana before submitting it to the rail worker');
+      return;
+    }
+
+    setSubmittingRailId(receipt.id);
+    setStatus(`Submitting ${receipt.id} to the ${receipt.rail.toUpperCase()} rail worker...`);
+    try {
+      const result = await submitRailAuthorizationToWorker(receipt, {
+        ...railOptionsForReceipt(receipt),
+        workerUrl: runtime.railWorkerUrl,
+        requireSolanaAnchor: true,
+      });
+
+      if (!result.ok) {
+        const reason = result.errors?.join('; ') || `rail worker returned HTTP ${result.status}`;
+        const failedReceipt = markPrivatePaymentRailFailed(receipt, reason, {
+          authorizationId: result.authorizationId,
+          workerUrl: result.workerUrl,
+          responseStatus: result.status,
+        });
+        const receipts = updatePrivatePaymentReceipt(failedReceipt);
+        setPaymentReceipts(receipts);
+        setLastPayment((current) => current?.id === receipt.id ? failedReceipt : current);
+        setStatus(`Rail worker rejected ${receipt.id}: ${reason}`);
+        return;
+      }
+
+      const submittedReceipt = markPrivatePaymentRailSubmitted(
+        receipt,
+        railWorkerStatusFromAuthorizeResult(result),
+      );
+      const receipts = updatePrivatePaymentReceipt(submittedReceipt);
+      setPaymentReceipts(receipts);
+      setLastPayment((current) => current?.id === receipt.id ? submittedReceipt : current);
+      setStatus(
+        `Rail worker accepted ${result.authorizationId} in ${result.mode ?? 'unknown'} mode; settlement ${result.settlement?.status ?? 'pending'}`,
+      );
+    } catch (error: any) {
+      const failedReceipt = markPrivatePaymentRailFailed(receipt, error.message, {
+        workerUrl: runtime.railWorkerUrl,
+      });
+      const receipts = updatePrivatePaymentReceipt(failedReceipt);
+      setPaymentReceipts(receipts);
+      setLastPayment((current) => current?.id === receipt.id ? failedReceipt : current);
+      setStatus(`Rail worker submit error: ${error.message}`);
+    } finally {
+      setSubmittingRailId(null);
+    }
+  };
+
+  const handleRefreshRailStatus = async (receipt: PrivatePaymentReceipt) => {
+    const authorizationId = receipt.railWorker?.authorizationId;
+    const workerUrl = receipt.railWorker?.workerUrl ?? runtime.railWorkerUrl;
+    if (!authorizationId || !workerUrl) {
+      setStatus('Submit this receipt to the rail worker before refreshing status');
+      return;
+    }
+
+    setRefreshingRailId(receipt.id);
+    setStatus(`Refreshing rail settlement ${authorizationId}...`);
+    try {
+      const result = await getRailWorkerSettlement(workerUrl, authorizationId);
+      if (!result.ok || !result.settlement) {
+        const reason = result.error ?? `rail worker returned HTTP ${result.status}`;
+        const failedReceipt = markPrivatePaymentRailFailed(receipt, reason, {
+          authorizationId,
+          workerUrl: result.workerUrl,
+          responseStatus: result.status,
+        });
+        const receipts = updatePrivatePaymentReceipt(failedReceipt);
+        setPaymentReceipts(receipts);
+        setLastPayment((current) => current?.id === receipt.id ? failedReceipt : current);
+        setStatus(`Rail status refresh failed: ${reason}`);
+        return;
+      }
+
+      const updatedReceipt = markPrivatePaymentRailStatus(
+        receipt,
+        railWorkerStatusFromLedgerEntry(result.workerUrl, result.settlement),
+      );
+      const receipts = updatePrivatePaymentReceipt(updatedReceipt);
+      setPaymentReceipts(receipts);
+      setLastPayment((current) => current?.id === receipt.id ? updatedReceipt : current);
+      setStatus(`Rail status: ${result.settlement.settlementStatus ?? 'pending'} for ${authorizationId}`);
+    } catch (error: any) {
+      const failedReceipt = markPrivatePaymentRailFailed(receipt, error.message, {
+        authorizationId,
+        workerUrl,
+      });
+      const receipts = updatePrivatePaymentReceipt(failedReceipt);
+      setPaymentReceipts(receipts);
+      setLastPayment((current) => current?.id === receipt.id ? failedReceipt : current);
+      setStatus(`Rail status error: ${error.message}`);
+    } finally {
+      setRefreshingRailId(null);
+    }
+  };
+
+  const handleAnchorPaymentReceipt = async (receipt: PrivatePaymentReceipt) => {
+    if (!publicKey) {
+      setStatus('Connect a wallet to anchor the private-payment intent on Solana');
+      return;
+    }
+
+    setAnchoringReceiptId(receipt.id);
+    setStatus(`Anchoring ${receipt.id} on Solana via Memo intent...`);
+    try {
+      const darkClient = createDarkProtocolClient(connection, wallet);
+      const signature = await darkClient.anchorPrivatePayment(receipt);
+      const anchoredReceipt = markPrivatePaymentAnchored(receipt, {
+        signature,
+        cluster: runtime.defaultNetwork,
+        payer: publicKey.toBase58(),
+        commitment: 'confirmed',
+      });
+      const receipts = updatePrivatePaymentReceipt(anchoredReceipt);
+      setPaymentReceipts(receipts);
+      setLastPayment((current) => current?.id === receipt.id ? anchoredReceipt : current);
+      setStatus(`Anchored ${receipt.id} on Solana: ${signature.slice(0, 20)}...`);
+    } catch (error: any) {
+      const failedReceipt = markPrivatePaymentFailed(receipt, error.message);
+      const receipts = updatePrivatePaymentReceipt(failedReceipt);
+      setPaymentReceipts(receipts);
+      setLastPayment((current) => current?.id === receipt.id ? failedReceipt : current);
+      setStatus(`Payment anchor error: ${error.message}`);
+    } finally {
+      setAnchoringReceiptId(null);
+    }
+  };
+
+  const handleVerifyPaymentReceipt = async (receipt: PrivatePaymentReceipt) => {
+    if (!receipt.solanaAnchor?.signature) {
+      setStatus('Anchor the private-payment receipt before verifying it');
+      return;
+    }
+
+    setVerifyingReceiptId(receipt.id);
+    setStatus(`Verifying ${receipt.id} against Solana Memo payload...`);
+    try {
+      const darkClient = createDarkProtocolClient(connection, wallet);
+      const result = await darkClient.verifyPrivatePaymentAnchor(receipt);
+      if (!result.ok) {
+        const reason = result.mismatches?.length
+          ? result.mismatches.join('; ')
+          : result.reason ?? 'Unknown verification failure';
+        const failedReceipt = markPrivatePaymentVerificationFailed(receipt, reason);
+        const receipts = updatePrivatePaymentReceipt(failedReceipt);
+        setPaymentReceipts(receipts);
+        setLastPayment((current) => current?.id === receipt.id ? failedReceipt : current);
+        setStatus(`Verification failed for ${receipt.id}: ${reason}`);
+        return;
+      }
+
+      const verifiedReceipt = markPrivatePaymentVerified(receipt, {
+        signature: result.signature,
+        slot: result.slot ?? 0,
+        blockTime: result.blockTime,
+        payer: result.payer ?? receipt.solanaAnchor.payer ?? '',
+        memoMatched: true,
+      });
+      const receipts = updatePrivatePaymentReceipt(verifiedReceipt);
+      setPaymentReceipts(receipts);
+      setLastPayment((current) => current?.id === receipt.id ? verifiedReceipt : current);
+      setStatus(`Verified ${receipt.id} on Solana slot ${result.slot}`);
+    } catch (error: any) {
+      const failedReceipt = markPrivatePaymentVerificationFailed(receipt, error.message);
+      const receipts = updatePrivatePaymentReceipt(failedReceipt);
+      setPaymentReceipts(receipts);
+      setLastPayment((current) => current?.id === receipt.id ? failedReceipt : current);
+      setStatus(`Verification error: ${error.message}`);
+    } finally {
+      setVerifyingReceiptId(null);
+    }
+  };
+
+  return (
+    <div className="space-y-6 paper-wallet-print-root">
+      <div className="section-header">
+        <p className="section-kicker">Cold Storage</p>
+        <h3 className="section-title">
+          Solana Paper Wallet
+        </h3>
+        <p className="section-copy">
+          Local Solana key generation adapted from the Zcash Sapling paper-wallet flow.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <section className="card paper-wallet-print-sheet">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 paper-wallet-controls">
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">Label</label>
+              <input className="input" value={label} onChange={(event) => setLabel(event.target.value)} />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">Network</label>
+              <input className="input" value={formatNetworkLabel(runtime.defaultNetwork)} readOnly />
+            </div>
+          </div>
+
+          <div className="mt-4 paper-wallet-controls">
+            <label className="block text-sm font-medium text-gray-300 mb-2">Extra Entropy</label>
+            <textarea
+              className="input min-h-[110px]"
+              value={entropy}
+              onChange={(event) => setEntropy(event.target.value)}
+              placeholder="Type random characters before generation"
+            />
+          </div>
+
+          <div className="surface-actions flex flex-wrap gap-3 mt-4 paper-wallet-controls">
+            <button className="btn-primary" onClick={handleGenerate} disabled={isBusy}>
+              Generate
+            </button>
+            <button className="btn-secondary" onClick={handlePrint} disabled={!paperWallet}>
+              Print
+            </button>
+            <button className="btn-secondary" onClick={handleDownload} disabled={!paperWallet}>
+              Download JSON
+            </button>
+          </div>
+
+          {paperWallet && (
+            <div className="mt-6 space-y-4 font-mono text-sm">
+              <div className="mini-panel">
+                <p className="metric-label mb-2">Public Key</p>
+                <p className="break-all text-cyan-300">{paperWallet.publicKey}</p>
+              </div>
+              <div className="mini-panel">
+                <div className="flex items-center justify-between gap-3 mb-2 paper-wallet-controls">
+                  <p className="metric-label">Secret Key JSON</p>
+                  <button className="text-xs text-cyan-300 hover:text-cyan-200" onClick={() => setShowSecret((value) => !value)}>
+                    {showSecret ? 'Hide' : 'Reveal'}
+                  </button>
+                </div>
+                <textarea
+                  className="input min-h-[180px] font-mono text-xs"
+                  readOnly
+                  value={showSecret ? paperWallet.secretKeyJson : '[hidden until reveal]'}
+                />
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="mini-panel">
+                  <p className="metric-label">Seed Fingerprint</p>
+                  <p className="text-emerald-300">{paperWallet.seedFingerprint}</p>
+                </div>
+                <div className="mini-panel">
+                  <p className="metric-label">Public Fingerprint</p>
+                  <p className="text-emerald-300">{paperWallet.publicFingerprint}</p>
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+
+        <section className="card paper-wallet-sidecar">
+          <p className="section-kicker mb-2">Review Boundary</p>
+          <h4 className="footer-title">Browser Security Posture</h4>
+          <textarea
+            className="input min-h-[120px]"
+            value={agentPrompt}
+            onChange={(event) => setAgentPrompt(event.target.value)}
+          />
+          <div className="mini-panel mt-4 min-h-[120px] text-sm text-gray-300 whitespace-pre-wrap">
+            Public browser builds do not accept raw xAI API-key env injection.
+            Keep model credentials on `dark-protocol/rail-worker` and use `Plan With Dark Clawd`
+            for server-side review of public rail metadata only.
+          </div>
+        </section>
+      </div>
+
+      <section className="card paper-wallet-sidecar">
+        <p className="section-kicker mb-2">Rail Primitive</p>
+        <h4 className="footer-title">Private Payment Primitive</h4>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <select className="input" value={rail} onChange={(event) => setRail(event.target.value as PrivatePaymentRail)}>
+            <option value="x402">x402</option>
+            <option value="ap2">AP2</option>
+            <option value="m2m">M2M</option>
+          </select>
+          <select className="input" value={settlement} onChange={(event) => setSettlement(event.target.value as PrivatePaymentSettlement)}>
+            <option value="solana">Solana settlement</option>
+            <option value="evm">EVM settlement</option>
+          </select>
+          <select className="input" value={proofLayer} onChange={(event) => setProofLayer(event.target.value as PrivatePaymentProofLayer)}>
+            <option value="evm">EVM proof</option>
+            <option value="solana">Solana proof</option>
+          </select>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+          <input className="input" type="number" min="0.001" step="0.01" value={paymentAmount} onChange={(event) => setPaymentAmount(event.target.value)} />
+          <input className="input" value={paymentRecipient} onChange={(event) => setPaymentRecipient(event.target.value)} placeholder={publicKey?.toBase58() || 'private-counterparty'} />
+          <input className="input" value={paymentMemo} onChange={(event) => setPaymentMemo(event.target.value)} />
+        </div>
+        <textarea
+          className="input mt-4 min-h-[120px]"
+          value={agentPrompt}
+          onChange={(event) => setAgentPrompt(event.target.value)}
+          placeholder="Operator note for deterministic or rail-worker planning"
+        />
+        <label className="mt-4 flex items-center gap-3 text-sm text-gray-300">
+          <input type="checkbox" checked={durableReceipt} onChange={(event) => setDurableReceipt(event.target.checked)} />
+          Durable non-ephemeral receipt
+        </label>
+        <div className="mt-4 flex flex-wrap gap-3">
+          <button className="btn-secondary" onClick={() => void handlePlanPaymentRail()} disabled={planningRail}>
+            {planningRail ? 'Planning...' : 'Plan With Dark Clawd'}
+          </button>
+          <button className="btn-secondary" onClick={handleApplyRailPlan} disabled={!railPlan}>
+            Apply Plan
+          </button>
+          <button
+            className="btn-secondary"
+            onClick={() => void handleCheckRailPreflight(false)}
+            disabled={!runtime.railWorkerUrl || checkingRailPreflight || probingRailPreflight}
+          >
+            {checkingRailPreflight ? 'Checking...' : 'Rail Preflight'}
+          </button>
+          <button
+            className="btn-secondary"
+            onClick={() => void handleCheckRailPreflight(true)}
+            disabled={!runtime.railWorkerUrl || checkingRailPreflight || probingRailPreflight}
+          >
+            {probingRailPreflight ? 'Probing...' : 'Probe Backends'}
+          </button>
+          <button className="btn-primary" onClick={handleStagePayment}>
+            Stage Private Payment
+          </button>
+        </div>
+        <p className="hint mt-3">
+          Dark Clawd rail planning sends only public intent metadata and fingerprints:
+          amount, rail, settlement, proof layer, config flags, and anchor status. It never sends secret-key JSON.
+          When RAIL_WORKER_URL is configured, the worker performs model review server-side and keeps xAI credentials off the browser.
+        </p>
+        {railPreflight && (
+          <RailPreflightPanel preflight={railPreflight} />
+        )}
+        {railPlanResponse && (
+          <div className="mini-panel mt-4 whitespace-pre-wrap text-sm text-gray-300">
+            {railPlanResponse}
+          </div>
+        )}
+        {lastPayment && (
+          <div className="mini-panel mt-4 text-sm text-gray-300">
+            <p>Receipt: {lastPayment.id}</p>
+            <p>Amount: {lastPayment.amountLamports} lamports</p>
+            <p>Commitment: {lastPayment.commitmentHex}</p>
+          </div>
+        )}
+        {paymentReceipts.length > 0 && (
+          <div className="mini-panel mt-4">
+            <div className="flex items-center justify-between gap-3 mb-3">
+              <div>
+                <p className="footer-title">Local Receipt History</p>
+                <p className="hint">
+                  Kept in this browser only; export payloads for EVM chain {runtime.evmChainId}
+                  {runtime.evmPrivatePaymentVerifier ? ` verifier ${runtime.evmPrivatePaymentVerifier.slice(0, 10)}...` : ''}
+                  {' '}or anchor the intent on Solana.
+                  {runtime.railWorkerUrl ? ` Rail worker: ${runtime.railWorkerUrl}` : ' Set RAIL_WORKER_URL to submit rails directly.'}
+                </p>
+              </div>
+              <span className="section-kicker">{paymentReceipts.length} stored</span>
+            </div>
+            <div className="space-y-3">
+              {paymentReceipts.slice(0, 5).map((receipt) => (
+                <div key={receipt.id} className="receipt-ticket">
+                  <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="receipt-id">{receipt.id}</p>
+                      <p className="receipt-meta">
+                        {receipt.rail.toUpperCase()} / {receipt.settlement.toUpperCase()} settlement / {receipt.proofLayer.toUpperCase()} proof
+                      </p>
+                      <p className={`receipt-status ${
+                        receipt.status === 'anchored'
+                          ? 'receipt-status-anchored'
+                          : receipt.status === 'failed'
+                            ? 'receipt-status-failed'
+                            : 'receipt-status-pending'
+                      }`}>
+                        {receipt.status.toUpperCase()}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button className="btn-secondary text-xs" onClick={() => handleExportPaymentProof(receipt)}>
+                        Export Proof Payload
+                      </button>
+                      <button className="btn-secondary text-xs" onClick={() => handleCheckEvmProof(receipt)} disabled={checkingProofId === receipt.id}>
+                        {checkingProofId === receipt.id ? 'Checking...' : 'Check EVM Proof'}
+                      </button>
+                      <button className="btn-secondary text-xs" onClick={() => handleExportRailAuthorization(receipt)}>
+                        Export Rail Auth
+                      </button>
+                      <button className="btn-secondary text-xs" onClick={() => handleCheckRailAuthorization(receipt)} disabled={checkingRailId === receipt.id}>
+                        {checkingRailId === receipt.id ? 'Checking...' : 'Check Rail Auth'}
+                      </button>
+                      <button className="btn-secondary text-xs" onClick={() => void handlePlanPaymentRail(receipt)} disabled={planningRail}>
+                        Plan Rail
+                      </button>
+                      <button
+                        className="btn-primary text-xs"
+                        onClick={() => handleSubmitRailAuthorization(receipt)}
+                        disabled={
+                          !runtime.railWorkerUrl
+                            || !receipt.solanaAnchor
+                            || submittingRailId === receipt.id
+                            || Boolean(receipt.railWorker?.authorizationId && !receipt.railWorker.lastError)
+                        }
+                      >
+                        {receipt.railWorker?.authorizationId && !receipt.railWorker.lastError
+                          ? 'Rail Submitted'
+                          : submittingRailId === receipt.id
+                            ? 'Submitting...'
+                            : 'Submit Rail'}
+                      </button>
+                      <button
+                        className="btn-secondary text-xs"
+                        onClick={() => handleRefreshRailStatus(receipt)}
+                        disabled={!receipt.railWorker?.authorizationId || refreshingRailId === receipt.id}
+                      >
+                        {refreshingRailId === receipt.id ? 'Refreshing...' : 'Rail Status'}
+                      </button>
+                      <button
+                        className="btn-primary text-xs"
+                        onClick={() => handleAnchorPaymentReceipt(receipt)}
+                        disabled={!publicKey || anchoringReceiptId === receipt.id || receipt.status === 'anchored'}
+                      >
+                        {receipt.status === 'anchored'
+                          ? 'Anchored'
+                          : anchoringReceiptId === receipt.id
+                            ? 'Anchoring...'
+                            : 'Anchor on Solana'}
+                      </button>
+                      <button
+                        className="btn-secondary text-xs"
+                        onClick={() => handleVerifyPaymentReceipt(receipt)}
+                        disabled={!receipt.solanaAnchor || verifyingReceiptId === receipt.id}
+                      >
+                        {receipt.solanaVerification
+                          ? 'Verified'
+                          : verifyingReceiptId === receipt.id
+                            ? 'Verifying...'
+                            : 'Verify Anchor'}
+                      </button>
+                    </div>
+                  </div>
+                  <p className="receipt-commitment">{receipt.commitmentHex}</p>
+                  {receipt.solanaAnchor && (
+                    <a
+                      className="receipt-link"
+                      href={receipt.solanaAnchor.explorerUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      Solana anchor: {receipt.solanaAnchor.signature.slice(0, 20)}...
+                    </a>
+                  )}
+                  {receipt.solanaVerification && (
+                    <p className="mt-2 text-xs text-emerald-300">
+                      Verified on slot {receipt.solanaVerification.slot} by {receipt.solanaVerification.payer.slice(0, 8)}...
+                    </p>
+                  )}
+                  {receipt.railWorker && (
+                    <div className="rail-worker-ticket">
+                      <p className="font-mono break-all">Rail auth: {receipt.railWorker.authorizationId || 'not recorded'}</p>
+                      <p>
+                        Worker: {receipt.railWorker.workerUrl || runtime.railWorkerUrl || 'not configured'} / {receipt.railWorker.mode ?? 'unsubmitted'}
+                      </p>
+                      <p>
+                        Settlement: {receipt.railWorker.settlementStatus ?? 'pending'}
+                        {receipt.railWorker.settled ? ' / settled' : ' / not settled'}
+                        {receipt.railWorker.ledgerDurable ? ' / durable ledger' : ''}
+                      </p>
+                      {receipt.railWorker.settlementId && (
+                        <p className="font-mono break-all">Settlement ID: {receipt.railWorker.settlementId}</p>
+                      )}
+                      {receipt.railWorker.transactionId && (
+                        <p className="font-mono break-all">Transaction ID: {receipt.railWorker.transactionId}</p>
+                      )}
+                      {receipt.railWorker.lastError && (
+                        <p className="text-red-300">Rail error: {receipt.railWorker.lastError}</p>
+                      )}
+                    </div>
+                  )}
+                  <EvmVerifierPlanPanel plan={receipt.railWorker?.evmVerifierPlan} />
+                  {receipt.lastError && (
+                    <p className="mt-2 text-xs text-red-300">{receipt.lastError}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </section>
+
+      {status && (
+        <div className={`status-banner ${
+          status.startsWith('Error') || status.includes('error')
+            ? 'status-banner-error'
+            : 'status-banner-info'
+        }`}>
+          {status}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default PaperWallet;

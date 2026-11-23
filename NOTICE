@@ -1,0 +1,38 @@
+ZOLana — public snapshot
+=========================
+
+This repository is a scoped public snapshot of the ZOLana project. It
+contains only the project's declared supported public surface:
+
+  - dark-wallet/                      (Dark Wallet browser wallet)
+  - dark-protocol/sdk/typescript/     (Dark Protocol TypeScript SDK)
+  - dark-protocol/rail-worker/        (Dark Protocol rail worker)
+
+Attributions
+------------
+
+Zcash
+  Portions of this project are derived from Zcash
+  (https://github.com/zcash/zcash), Copyright (c) The Zcash developers,
+  licensed under the MIT License (see the LICENSE file in this
+  repository). Zcash-derived material has NOT been relicensed: the
+  repository README badge's Apache-2.0 claim applies to the project's
+  original components (below), not to the Zcash-derived material.
+
+Zecwallet
+  dark-wallet/zecwallet-master/ contains material from Zecwallet,
+  Copyright 2018 adityapk, licensed under the MIT License; its own
+  LICENSE file is preserved in that directory. The precompiled Zcash
+  node binaries distributed inside that directory in the source
+  repository were excluded from this snapshot as build output.
+
+Original ZOLana components
+  Dark Wallet, the Dark Protocol TypeScript SDK, and the Dark Protocol
+  rail worker are original components of this repository, developed by
+  the ZOLana / Dark Protocol team. Their package manifests
+  (dark-wallet/package.json, dark-protocol/sdk/typescript/package.json,
+  dark-protocol/rail-worker/package.json) each declare Apache-2.0.
+
+Third-party libraries (Backpack, the Helius SDK, Jupiter, Solana
+web3.js, and others) are referenced as package dependencies only; no
+vendored copies of those trees are included in this snapshot.
